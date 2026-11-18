@@ -1,0 +1,310 @@
+//@version=6
+// =====================================================================================
+//  CANDLE_BASE  v1.0  —  Candlestick pattern detection engine (BASE MODULE, not a strategy)
+// =====================================================================================
+//  Patterns : Hammer, Inverted Hammer, Bullish/Bearish Engulfing, Bullish/Bearish Harami
+//  Purpose  : Shared, reusable geometric detector. Contains NO trade logic, NO trend
+//             context, NO session filter. Strategies layer that on top.
+//
+//  DESIGN RULES (these are what keep MQL5 parity exact — do not "simplify" them):
+//    R1. No division anywhere in the detection path. Every ratio test is written as a
+//        multiplication, so a zero/near-zero body can never produce an infinite ratio.
+//    R2. Volatility reference = median (or mean) of the last N true ranges. NON-RECURSIVE.
+//        ta.atr() is deliberately NOT used: it is Wilder-smoothed and MT5's ATR is not,
+//        which would inject a permanent, invisible threshold drift between platforms.
+//    R3. The volatility window EXCLUDES the pattern bars, so a large pattern bar cannot
+//        inflate its own yardstick and veto itself.
+//    R4. Harami containment reads bodyTop/bodyBot ONLY. high/low are never referenced.
+//        Wicks may break out of the mother candle in any direction.
+//    R5. All ta.*/stateful calls live in global scope. Pine v6 evaluates and/or LAZILY,
+//        so a stateful call inside an `and` chain would be skipped on some bars and
+//        silently corrupt its own internal history.
+//    R6. Signals gate on barstate.isconfirmed -> no repainting, no intrabar flicker.
+//
+//  Int division note (v6): `n / 2` returns a FRACTIONAL value even for const ints.
+//  Median index must therefore be wrapped in int() — see f_volRef().
+// =====================================================================================
+
+indicator("CANDLE_BASE v1.0 — Pattern Detection Engine", "CANDLE_BASE", overlay = true,
+          max_bars_back = 500, max_lines_count = 50)
+
+// -------------------------------------------------------------------------------------
+// INPUT GROUPS
+// -------------------------------------------------------------------------------------
+const string G_VOL = "1 · Volatility reference"
+const string G_GEN = "2 · Global noise gates"
+const string G_HAM = "3 · Hammer / Inverted Hammer"
+const string G_ENG = "4 · Engulfing"
+const string G_HAR = "5 · Harami"
+const string G_VIS = "6 · Display"
+
+// ---- 1. Volatility reference --------------------------------------------------------
+int    volLen     = input.int(15, "TR window length (bars)", minval = 3, maxval = 200, group = G_VOL,
+     tooltip = "Number of true-range values aggregated into the volatility yardstick. Must match the MQL5 input exactly.")
+string volMethod  = input.string("Median", "TR aggregation", options = ["Median", "Mean"], group = G_VOL,
+     tooltip = "Median is robust to weekend gaps and news spikes. A single gap bar inflates a Mean for the whole window and suppresses valid signals.")
+
+// ---- 2. Global noise gates ----------------------------------------------------------
+float minRangeVol    = input.float(0.50, "Min bar range (× volRef)", minval = 0.0, maxval = 5.0, step = 0.05, group = G_GEN,
+     tooltip = "Rejects dead-tick bars. A bar whose whole range is a fraction of recent true range cannot carry a meaningful pattern.")
+float eqTolVol       = input.float(0.02, "Body-direction tolerance (× volRef)", minval = 0.0, maxval = 0.5, step = 0.01, group = G_GEN,
+     tooltip = "A bar is 'bullish' only if close exceeds open by more than this. Bars inside the band are directionless and fail colour tests.")
+float minBodyFracRng = input.float(0.05, "Doji threshold: body ≥ (× range)", minval = 0.0, maxval = 0.5, step = 0.01, group = G_GEN,
+     tooltip = "Below this body-to-range fraction a bar is classified as a doji.")
+
+// ---- 3. Hammer / Inverted Hammer ----------------------------------------------------
+float hamWickFrac   = input.float(0.55, "Signal wick ≥ (× range)", minval = 0.30, maxval = 0.90, step = 0.01, group = G_HAM,
+     tooltip = "PRIMARY gate. Lower wick for Hammer, upper wick for Inverted Hammer. Range-relative, so it cannot blow up on small bodies.")
+float hamBodyFrac   = input.float(0.35, "Body ≤ (× range)", minval = 0.05, maxval = 0.60, step = 0.01, group = G_HAM)
+float hamOppWickFrac= input.float(0.15, "Opposite wick ≤ (× range)", minval = 0.0, maxval = 0.50, step = 0.01, group = G_HAM,
+     tooltip = "Upper wick for Hammer, lower wick for Inverted Hammer.")
+float hamWickToBody = input.float(2.00, "Signal wick ≥ (× body)", minval = 0.0, maxval = 10.0, step = 0.1, group = G_HAM,
+     tooltip = "SECONDARY gate, classic form. Written as a multiplication so a near-zero body cannot produce an infinite ratio.")
+bool  hamAllowDoji  = input.bool(true, "Allow doji body (dragonfly / gravestone)", group = G_HAM)
+string hamColour    = input.string("Any", "Hammer body colour", options = ["Any", "Bullish only", "Bearish only"], group = G_HAM)
+string invColour    = input.string("Any", "Inv. Hammer body colour", options = ["Any", "Bullish only", "Bearish only"], group = G_HAM)
+
+// ---- 4. Engulfing -------------------------------------------------------------------
+float engPrevBodyVol = input.float(0.15, "Mother body ≥ (× volRef)", minval = 0.0, maxval = 3.0, step = 0.05, group = G_ENG,
+     tooltip = "Stops a meaningless 'engulf' of a doji-sized prior body.")
+float engCurBodyVol  = input.float(0.30, "Engulfing body ≥ (× volRef)", minval = 0.0, maxval = 5.0, step = 0.05, group = G_ENG)
+float engRatio       = input.float(1.20, "Engulfing body ≥ (× mother body)", minval = 1.0, maxval = 5.0, step = 0.05, group = G_ENG,
+     tooltip = "Dominance requirement. 1.00 would admit a one-tick engulf.")
+float engEdgeTolVol  = input.float(0.02, "Edge tolerance (× volRef)", minval = -0.50, maxval = 0.50, step = 0.01, group = G_ENG,
+     tooltip = "SIGNED. Positive = the engulfing body may fall short of the mother edge by this much and still count (fixes the open==prior-close starvation in a continuous feed). Negative = require strict overshoot by this much.")
+float engBodyFracRng = input.float(0.00, "Conviction: body ≥ (× own range)", minval = 0.0, maxval = 0.95, step = 0.05, group = G_ENG,
+     tooltip = "Optional. 0 = off. Raise to reject engulfing bars that closed far from their extreme.")
+
+// ---- 5. Harami ----------------------------------------------------------------------
+float harMotherVol    = input.float(0.40, "Mother body ≥ (× volRef)", minval = 0.0, maxval = 5.0, step = 0.05, group = G_HAR,
+     tooltip = "The mother must be a real directional candle, not a doji that anything fits inside.")
+float harChildRatio   = input.float(0.70, "Child body ≤ (× mother body)", minval = 0.05, maxval = 1.0, step = 0.05, group = G_HAR,
+     tooltip = "Contraction requirement. 1.00 admits a child that is 99% of the mother, which carries no information.")
+float harEdgeTolVol   = input.float(0.02, "Containment margin (× volRef)", minval = -0.50, maxval = 0.50, step = 0.01, group = G_HAR,
+     tooltip = "SIGNED. Positive = child body must sit inside the mother body by at least this margin. Negative = allow the child body to overshoot slightly.")
+bool  harAllowCross   = input.bool(true, "Allow doji child (harami cross)", group = G_HAR)
+bool  harOppColour    = input.bool(true, "Require opposite child colour", group = G_HAR,
+     tooltip = "OFF = direction is taken from the mother candle only; same-colour inside bars also qualify.")
+float harChildRngCap  = input.float(0.00, "Child RANGE ≤ (× mother range)", minval = 0.0, maxval = 3.0, step = 0.05, group = G_HAR,
+     tooltip = "0 = OFF (your spec: wicks may break out freely). Set >0 only if you later decide a child whose wicks dwarf the mother is not a contraction.")
+
+// ---- 6. Display ---------------------------------------------------------------------
+bool showHammer   = input.bool(true,  "Hammer",            group = G_VIS, inline = "a")
+bool showInvHam   = input.bool(true,  "Inv. Hammer",       group = G_VIS, inline = "a")
+bool showBullEng  = input.bool(true,  "Bull Engulfing",    group = G_VIS, inline = "b")
+bool showBearEng  = input.bool(true,  "Bear Engulfing",    group = G_VIS, inline = "b")
+bool showBullHar  = input.bool(true,  "Bull Harami",       group = G_VIS, inline = "c")
+bool showBearHar  = input.bool(true,  "Bear Harami",       group = G_VIS, inline = "c")
+bool showPanel    = input.bool(true,  "Show metrics panel (last confirmed bar)", group = G_VIS)
+bool highlightBar = input.bool(false, "Tint bars carrying any pattern",          group = G_VIS)
+
+// =====================================================================================
+//  TRUE RANGE SERIES  (computed manually — identical formula on both platforms)
+// =====================================================================================
+// R5: global scope, evaluated on every bar regardless of any condition.
+float trSeries = na(close[1]) ? high - low
+                 : math.max(high - low, math.max(math.abs(high - close[1]), math.abs(low - close[1])))
+
+//@function Aggregates `volLen` true ranges starting `startOff` bars back.
+//          startOff = 1 for single-bar patterns, 2 for two-bar patterns (R3).
+f_volRef(int startOff) =>
+    array<float> buf = array.new<float>()
+    float    sum     = 0.0
+    int      endOff  = startOff + volLen - 1          // v6 evaluates `to_num` per iteration — hoist it
+    for i = startOff to endOff
+        float v = nz(trSeries[i])
+        sum += v
+        buf.push(v)
+    int   n   = buf.size()
+    float out = 0.0
+    if n > 0
+        if volMethod == "Mean"
+            out := sum / n
+        else
+            buf.sort(order.ascending)
+            int mid = int(n / 2)                      // int() required: v6 const-int division is fractional
+            out := n % 2 == 1 ? buf.get(mid) : (buf.get(mid - 1) + buf.get(mid)) * 0.5
+    out
+
+float volRef1 = f_volRef(1)      // window for single-bar patterns
+float volRef2 = f_volRef(2)      // window for two-bar patterns
+
+// =====================================================================================
+//  BAR GEOMETRY
+// =====================================================================================
+// Current (pattern) bar — Pine offset 0
+float cO = open,  cH = high,  cL = low,  cC = close
+float cRng  = cH - cL
+float cBody = math.abs(cC - cO)
+float cTop  = math.max(cO, cC)       // body top  — NOT the high
+float cBot  = math.min(cO, cC)       // body bot  — NOT the low
+float cUw   = cH - cTop
+float cLw   = cBot - cL
+
+// Mother bar — Pine offset 1
+float pO = open[1], pH = high[1], pL = low[1], pC = close[1]
+float pRng  = pH - pL
+float pBody = math.abs(pC - pO)
+float pTop  = math.max(pO, pC)
+float pBot  = math.min(pO, pC)
+
+// Volatility-scaled tolerances
+float tol1     = eqTolVol      * volRef1
+float tol2     = eqTolVol      * volRef2
+float engEdge  = engEdgeTolVol * volRef2
+float harEdge  = harEdgeTolVol * volRef2
+
+// Validity / significance
+// Warm-up guards MUST match CandleBase.mqh exactly (idx >= volLen+1 / volLen+2).
+bool valid1 = cRng > 0.0 and volRef1 > 0.0 and bar_index >= volLen + 1
+bool valid2 = cRng > 0.0 and pRng > 0.0 and volRef2 > 0.0 and bar_index >= volLen + 2
+bool sig1   = valid1 and cRng >= minRangeVol * volRef1
+bool sig2   = valid2 and cRng >= minRangeVol * volRef2
+
+// Direction (tolerance band => a near-flat body is DIRECTIONLESS, not bullish)
+bool cBull1 = cC > cO + tol1
+bool cBear1 = cC < cO - tol1
+bool cBull2 = cC > cO + tol2
+bool cBear2 = cC < cO - tol2
+bool pBull2 = pC > pO + tol2
+bool pBear2 = pC < pO - tol2
+
+// Doji classification (multiplication form, R1)
+bool cIsDoji = cBody < minBodyFracRng * cRng
+bool pIsDoji = pBody < minBodyFracRng * pRng
+
+// =====================================================================================
+//  PATTERN 1/2 — HAMMER  &  INVERTED HAMMER
+// =====================================================================================
+//  NOTE ON NAMING: geometrically, Hammer == Hanging Man and Inverted Hammer == Shooting
+//  Star. Only prior trend context separates them, and context is NOT this module's job.
+//  Treat these outputs as SHAPES. The strategy decides what the shape means where it is.
+// -------------------------------------------------------------------------------------
+bool hamColourOK = hamColour == "Any" ? true : hamColour == "Bullish only" ? cBull1 : cBear1
+bool invColourOK = invColour == "Any" ? true : invColour == "Bullish only" ? cBull1 : cBear1
+bool dojiOK      = hamAllowDoji or not cIsDoji
+
+bool rawHammer = sig1
+     and cLw   >= hamWickFrac    * cRng        // long lower wick       (primary)
+     and cBody <= hamBodyFrac    * cRng        // small body            (primary)
+     and cUw   <= hamOppWickFrac * cRng        // negligible upper wick (primary)
+     and cLw   >= hamWickToBody  * cBody       // classic 2:1 form      (secondary, mult-form)
+     and dojiOK and hamColourOK
+
+bool rawInvHammer = sig1
+     and cUw   >= hamWickFrac    * cRng
+     and cBody <= hamBodyFrac    * cRng
+     and cLw   <= hamOppWickFrac * cRng
+     and cUw   >= hamWickToBody  * cBody
+     and dojiOK and invColourOK
+
+// =====================================================================================
+//  PATTERN 3/4 — ENGULFING   (BODY engulfing; wicks are not consulted)
+// =====================================================================================
+bool engSizeOK  = pBody >= engPrevBodyVol * volRef2
+     and cBody >= engCurBodyVol  * volRef2
+     and cBody >= engRatio       * pBody
+     and cBody >= engBodyFracRng * cRng
+// Engulf containment with signed edge tolerance.
+bool engWraps   = cTop >= pTop - engEdge and cBot <= pBot + engEdge
+
+bool rawBullEngulf = sig2 and pBear2 and cBull2 and not pIsDoji and engSizeOK and engWraps
+bool rawBearEngulf = sig2 and pBull2 and cBear2 and not pIsDoji and engSizeOK and engWraps
+
+// =====================================================================================
+//  PATTERN 5/6 — HARAMI
+// =====================================================================================
+//  R4 — CONTAINMENT IS BODY-AGAINST-BODY ONLY.
+//  `high` and `low` are NOT referenced below. The child's wicks are free to break above
+//  the mother's high, below its low, or both, and the pattern still qualifies, exactly
+//  as specified. Only the child's OPEN and CLOSE must sit inside the mother's open/close
+//  range.
+// -------------------------------------------------------------------------------------
+bool harInside   = cTop <= pTop - harEdge and cBot >= pBot + harEdge
+bool harSizeOK   = pBody >= harMotherVol  * volRef2
+     and cBody <= harChildRatio * pBody
+bool harCrossOK  = harAllowCross or not cIsDoji
+bool harRangeOK  = harChildRngCap <= 0.0 or cRng <= harChildRngCap * pRng
+bool harCommon   = sig2 and not pIsDoji and harInside and harSizeOK and harCrossOK and harRangeOK
+
+// Direction is defined by the MOTHER candle. Child colour is an optional confirmation.
+bool rawBullHarami = harCommon and pBear2 and (not harOppColour or cBull2)
+bool rawBearHarami = harCommon and pBull2 and (not harOppColour or cBear2)
+
+// =====================================================================================
+//  CONFIRMATION GATE  (R6 — non-repainting)
+// =====================================================================================
+bool conf        = barstate.isconfirmed
+bool isHammer    = rawHammer      and conf
+bool isInvHammer = rawInvHammer   and conf
+bool isBullEng   = rawBullEngulf  and conf
+bool isBearEng   = rawBearEngulf  and conf
+bool isBullHar   = rawBullHarami  and conf
+bool isBearHar   = rawBearHarami  and conf
+
+// =====================================================================================
+//  PLOTS
+// =====================================================================================
+color cBullPat = #089981
+color cBearPat = #F23645
+color cNeutral = #2962FF
+
+plotshape(showHammer  and isHammer,    "Hammer",          shape.triangleup,   location.belowbar, color.new(cBullPat, 0),  text = "H",  textcolor = color.new(cBullPat, 0), size = size.tiny)
+plotshape(showInvHam  and isInvHammer, "Inverted Hammer", shape.triangleup,   location.belowbar, color.new(cNeutral, 0),  text = "IH", textcolor = color.new(cNeutral, 0), size = size.tiny)
+plotshape(showBullEng and isBullEng,   "Bull Engulfing",  shape.labelup,      location.belowbar, color.new(cBullPat, 20), text = "BE", textcolor = color.white,            size = size.tiny)
+plotshape(showBearEng and isBearEng,   "Bear Engulfing",  shape.labeldown,    location.abovebar, color.new(cBearPat, 20), text = "SE", textcolor = color.white,            size = size.tiny)
+plotshape(showBullHar and isBullHar,   "Bull Harami",     shape.diamond,      location.belowbar, color.new(cBullPat, 40), text = "BH", textcolor = color.new(cBullPat, 0), size = size.tiny)
+plotshape(showBearHar and isBearHar,   "Bear Harami",     shape.diamond,      location.abovebar, color.new(cBearPat, 40), text = "SH", textcolor = color.new(cBearPat, 0), size = size.tiny)
+
+bool anyBull = isHammer or isInvHammer or isBullEng or isBullHar
+bool anyBear = isBearEng or isBearHar
+barcolor(highlightBar ? (anyBull ? cBullPat : anyBear ? cBearPat : na) : na, title = "Pattern tint")
+
+// ---- Data-window exports: the EXACT values the EA consumes (code standard §10) -------
+plot(volRef1,                 "volRef1 (1-bar window)",  display = display.data_window)
+plot(volRef2,                 "volRef2 (2-bar window)",  display = display.data_window)
+plot(cBody,                   "bodyC",                   display = display.data_window)
+plot(cRng,                    "rangeC",                  display = display.data_window)
+plot(cLw,                     "lowerWickC",              display = display.data_window)
+plot(cUw,                     "upperWickC",              display = display.data_window)
+plot(isHammer    ? 1 : 0,     "flag HAMMER",             display = display.data_window)
+plot(isInvHammer ? 1 : 0,     "flag INV_HAMMER",         display = display.data_window)
+plot(isBullEng   ? 1 : 0,     "flag BULL_ENGULF",        display = display.data_window)
+plot(isBearEng   ? 1 : 0,     "flag BEAR_ENGULF",        display = display.data_window)
+plot(isBullHar   ? 1 : 0,     "flag BULL_HARAMI",        display = display.data_window)
+plot(isBearHar   ? 1 : 0,     "flag BEAR_HARAMI",        display = display.data_window)
+
+// ---- Alerts -------------------------------------------------------------------------
+alertcondition(isHammer,    "Hammer",           "CANDLE_BASE: Hammer")
+alertcondition(isInvHammer, "Inverted Hammer",  "CANDLE_BASE: Inverted Hammer")
+alertcondition(isBullEng,   "Bull Engulfing",   "CANDLE_BASE: Bullish Engulfing")
+alertcondition(isBearEng,   "Bear Engulfing",   "CANDLE_BASE: Bearish Engulfing")
+alertcondition(isBullHar,   "Bull Harami",      "CANDLE_BASE: Bullish Harami")
+alertcondition(isBearHar,   "Bear Harami",      "CANDLE_BASE: Bearish Harami")
+
+// =====================================================================================
+//  METRICS PANEL — read these off the last confirmed bar and compare against the
+//  Print() output of the MQL5 scanner to validate parity at SIGNAL level.
+// =====================================================================================
+// NOTE: Pine does not permit function declarations inside a local scope.
+// Both the table and the helper MUST live at global scope.
+var table cbPanel = table.new(position.top_right, 2, 11, color.new(color.black, 20),
+                              border_color = color.new(color.gray, 50), border_width = 1)
+
+//@function Writes one key/value row into the metrics panel.
+f_row(table tb, int r, string k, string v) =>
+    tb.cell(0, r, k, text_color = color.silver, text_size = size.tiny, text_halign = text.align_left)
+    tb.cell(1, r, v, text_color = color.white,  text_size = size.tiny, text_halign = text.align_right)
+
+if showPanel and barstate.islastconfirmedhistory
+    f_row(cbPanel, 0,  "CANDLE_BASE — last confirmed", str.format("{0,date,yyyy.MM.dd HH:mm}", time))
+    f_row(cbPanel, 1,  "volRef1 / volRef2",     str.tostring(volRef1, "#.#####") + " / " + str.tostring(volRef2, "#.#####"))
+    f_row(cbPanel, 2,  "range / body",          str.tostring(cRng,    "#.#####") + " / " + str.tostring(cBody,   "#.#####"))
+    f_row(cbPanel, 3,  "lowerWick / upperWick", str.tostring(cLw,     "#.#####") + " / " + str.tostring(cUw,     "#.#####"))
+    f_row(cbPanel, 4,  "bodyTop / bodyBot",     str.tostring(cTop,    "#.#####") + " / " + str.tostring(cBot,    "#.#####"))
+    f_row(cbPanel, 5,  "HAMMER",       isHammer    ? "YES" : "-")
+    f_row(cbPanel, 6,  "INV_HAMMER",   isInvHammer ? "YES" : "-")
+    f_row(cbPanel, 7,  "BULL_ENGULF",  isBullEng   ? "YES" : "-")
+    f_row(cbPanel, 8,  "BEAR_ENGULF",  isBearEng   ? "YES" : "-")
+    f_row(cbPanel, 9,  "BULL_HARAMI",  isBullHar   ? "YES" : "-")
+    f_row(cbPanel, 10, "BEAR_HARAMI",  isBearHar   ? "YES" : "-")
