@@ -103,4 +103,4 @@ Issues and pull requests welcome. If you find a bar where the two implementation
 
 MIT — see [LICENSE](LICENSE).
 
-Built by Aradhya Vikram · [AURAXIS](https://auraxis.com)
+Built by Aradhya Vikram ·
